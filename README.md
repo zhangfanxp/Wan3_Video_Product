@@ -1,6 +1,6 @@
 # 阿里云百炼批量分镜视频生成器
 
-当前版本：**v1.03**
+当前版本：**v1.04**
 
 基于 Gradio 和阿里云百炼 Wan3.0 视频生成接口。最多可填写 5 个分镜，每个分镜可单独设置首帧图片、视频提示词、对白/旁白、音轨、横竖屏和时长。生成后可下载分镜 ZIP，或按分镜顺序合并为一个视频。
 
@@ -10,6 +10,7 @@
 - 分镜任务按顺序执行；单个分镜失败会记录错误并继续后续分镜。
 - 支持为每个分镜单独设置对白/旁白和是否生成音轨。
 - 用户登录后可分别配置百炼模型、API Key 和接口地址。
+- 可测试百炼 API Key、接口连接和所选模型是否可查询；测试成功后，下次登录自动折叠配置区。
 - 模型下拉框提供 `wan3.0-video-prime`（默认）和 `wan3.0-video`。
 - 超级管理员可创建、删除普通账号并重置普通账号密码。
 - 超级管理员可查看视频生成操作日志，并导出完整 Excel 文件。
@@ -75,6 +76,8 @@ nano .env
 
 模型在网页中通过下拉框选择，默认是 `wan3.0-video-prime`，也可选择 `wan3.0-video`。`.env` 中的视频生成和任务查询地址只作为新账号的初始默认值；用户可以分别修改自己的模型、API Key 和接口地址。
 
+保存或填写配置后，可点击“测试百炼接口”。测试会通过只读的模型列表接口校验 API Key、接口连接及所选模型是否可查询，不会提交视频生成任务或产生视频生成费用；实际生成仍受模型权限、账户额度和服务状态影响。测试成功后，如果模型、API Key 和接口地址保持不变，下次登录时“账号与百炼配置”会默认折叠；修改配置后会重新展开。
+
 首次启动后使用以下默认超级管理员账号登录：
 
 ```text
@@ -94,14 +97,31 @@ nano .env
 python app.py
 ```
 
-本机浏览器访问 <http://127.0.0.1:7860>。按 `Control+C` 可停止服务。
+本机浏览器访问 <http://127.0.0.1:8860>。按 `Control+C` 可停止手动启动的服务。
+
+## macOS 登录自动启动
+
+此项目已在当前 Mac 用户的 `launchd` 中注册为 `com.wan3videoproduct.app`，登录 macOS 后会自动启动，进程退出后会自动重启。服务监听端口为 `8860`。LaunchAgent 文件位于 `~/Library/LaunchAgents/com.wan3videoproduct.app.plist`。
+
+查看服务状态或重启：
+
+```bash
+launchctl print gui/$(id -u)/com.wan3videoproduct.app
+launchctl kickstart -k gui/$(id -u)/com.wan3videoproduct.app
+```
+
+卸载当前登录会话中的服务：
+
+```bash
+launchctl bootout gui/$(id -u)/com.wan3videoproduct.app
+```
 
 ## 局域网访问
 
-默认服务监听 `0.0.0.0:7860`。让其他设备连接到同一可信局域网，再在浏览器打开：
+默认服务监听 `0.0.0.0:8860`。让其他设备连接到同一可信局域网，再在浏览器打开：
 
 ```text
-http://运行应用的Mac电脑局域网IP:7860
+http://运行应用的Mac电脑局域网IP:8860
 ```
 
 macOS 可在“系统设置 → Wi-Fi → 当前网络详情”中查看局域网 IP，也可在终端运行：
@@ -116,7 +136,7 @@ ipconfig getifaddr en0
 
 ```dotenv
 GRADIO_SERVER_NAME=0.0.0.0
-GRADIO_SERVER_PORT=7860
+GRADIO_SERVER_PORT=8860
 ```
 
 ## 使用批量分镜功能
@@ -164,7 +184,7 @@ GRADIO_SERVER_PORT=7860
 | `VIDEO_OUTPUT_DIR` | `generated_videos` | 视频及下载文件目录 |
 | `VIDEO_LOG_FILE` | `logs/generation.log` | 成功分镜的本地日志 |
 | `GRADIO_SERVER_NAME` | `0.0.0.0` | Gradio 监听地址 |
-| `GRADIO_SERVER_PORT` | `7860` | Gradio 监听端口 |
+| `GRADIO_SERVER_PORT` | `8860` | Gradio 监听端口 |
 
 账号配置保存在项目根目录的 `user.json`。上传的图片按 Wan3.0 的 `input.media` / `first_frame` 格式传递。对白/旁白会并入生成提示词；勾选音轨时请求 `parameters.audio=true`。
 

@@ -1,5 +1,6 @@
 import base64
 import csv
+import hashlib
 import hmac
 import json
 import logging
@@ -15,7 +16,7 @@ import zipfile
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import gradio as gr
 import requests
@@ -75,7 +76,7 @@ OPERATION_LOG_HEADERS = (
     "错误信息",
 )
 SERVER_HOST = os.getenv("GRADIO_SERVER_NAME", "0.0.0.0")
-SERVER_PORT = int(os.getenv("GRADIO_SERVER_PORT", "7860"))
+SERVER_PORT = int(os.getenv("GRADIO_SERVER_PORT", "8860"))
 
 _user_store_lock = threading.RLock()
 _active_user_lock = threading.Lock()
@@ -327,6 +328,32 @@ def _validate_endpoint_urls(synthesis_url: str, task_url_template: str) -> None:
         raise gr.Error("任务查询地址必须以 https:// 开头。")
     if "{task_id}" not in task_url_template:
         raise gr.Error("任务查询地址模板必须包含 {task_id}。")
+
+
+def _account_config_fingerprint(
+    model: str,
+    api_key: str,
+    synthesis_url: str,
+    task_url_template: str,
+) -> str:
+    config = json.dumps(
+        [model, api_key, synthesis_url, task_url_template],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(config.encode("utf-8")).hexdigest()
+
+
+def _model_catalog_url(synthesis_url: str) -> str:
+    parsed = urlsplit(synthesis_url)
+    api_path_marker = "/api/v1"
+    marker_position = parsed.path.find(api_path_marker)
+    if marker_position < 0:
+        raise gr.Error("视频生成接口地址中未找到 /api/v1，无法执行接口测试。")
+    api_path = parsed.path[: marker_position + len(api_path_marker)]
+    return urlunsplit(
+        (parsed.scheme, parsed.netloc, f"{api_path.rstrip('/')}/models", "", "")
+    )
 
 
 def _authorization_headers(api_key: str) -> dict[str, str]:
@@ -806,16 +833,33 @@ def load_account_settings(request: gr.Request):
     unsupported_model = model not in MODEL_CHOICES
     if unsupported_model:
         model = MODEL
-    role_label = "超级管理员" if is_admin else "普通用户"
-    status = (
-        f"当前账号：`{username}`（{role_label}）。此前保存的模型已不在可选列表中，请选择模型并保存。"
-        if unsupported_model
-        else (
-            f"当前账号：`{username}`（{role_label}）。百炼配置已完成。"
-            if configured
-            else f"当前账号：`{username}`（{role_label}）。首次使用前请填写模型、API Key 和接口地址。"
-        )
+    saved_config_fingerprint = _account_config_fingerprint(
+        str(user.get("model") or MODEL),
+        str(user.get("api_key", "")).strip(),
+        str(user.get("synthesis_url") or SYNTHESIS_URL),
+        str(user.get("task_url_template") or TASK_URL_TEMPLATE),
     )
+    api_test_passed = configured and hmac.compare_digest(
+        str(user.get("api_config_tested_fingerprint", "")),
+        saved_config_fingerprint,
+    )
+    role_label = "超级管理员" if is_admin else "普通用户"
+    if unsupported_model:
+        status = (
+            f"当前账号：`{username}`（{role_label}）。此前保存的模型已不在可选列表中，"
+            "请重新选择模型并保存。"
+        )
+    elif not configured:
+        status = (
+            f"当前账号：`{username}`（{role_label}）。首次使用前请填写模型、API Key 和接口地址。"
+        )
+    elif api_test_passed:
+        status = f"当前账号：`{username}`（{role_label}）。百炼配置已保存且接口测试通过。"
+    else:
+        status = (
+            f"当前账号：`{username}`（{role_label}）。百炼配置已保存，尚未通过接口测试。"
+            "请检查配置后点击“测试百炼接口”。"
+        )
     return (
         model,
         str(user.get("synthesis_url") or SYNTHESIS_URL),
@@ -825,7 +869,95 @@ def load_account_settings(request: gr.Request):
         _format_user_list(_read_user_store()) if is_admin else "",
         gr.update(visible=is_admin),
         _operation_log_table_data() if is_admin else [],
+        gr.update(open=not api_test_passed),
     )
+
+
+def test_account_settings(
+    model: str,
+    api_key: str,
+    synthesis_url: str,
+    task_url_template: str,
+    request: gr.Request,
+):
+    username = _request_username(request)
+    user = _get_user_record(username)
+    model = (model or "").strip()
+    api_key = (api_key or "").strip() or str(user.get("api_key", "")).strip()
+    synthesis_url = (synthesis_url or "").strip()
+    task_url_template = (task_url_template or "").strip()
+
+    if model not in MODEL_CHOICES:
+        raise gr.Error("请选择支持的百炼模型后再测试。")
+    if not api_key:
+        raise gr.Error("请先填写 API Key，或先保存已有的 API Key。")
+    _validate_endpoint_urls(synthesis_url, task_url_template)
+    catalog_url = _model_catalog_url(synthesis_url)
+
+    try:
+        response = requests.get(
+            catalog_url,
+            headers={
+                **_authorization_headers(api_key),
+                "Content-Type": "application/json",
+            },
+            params={"model": model, "page_no": 1, "page_size": 20},
+            timeout=(10, 30),
+        )
+    except requests.RequestException as exc:
+        message = str(exc).replace(api_key, _mask_api_key(api_key))
+        raise gr.Error(f"连接百炼接口失败：{message}") from exc
+
+    if not response.ok:
+        if response.status_code == 401:
+            raise gr.Error("API Key 无效，或 API Key 与接口地域/业务空间不匹配。")
+        if response.status_code == 403:
+            raise gr.Error("API Key 已被识别，但没有访问该模型目录的权限。")
+        detail = _response_error(response).replace(api_key, _mask_api_key(api_key))
+        raise gr.Error(f"百炼接口测试失败：{detail}")
+
+    try:
+        response_data = response.json()
+    except ValueError as exc:
+        raise gr.Error("百炼接口返回了无法识别的响应，无法确认 API Key 状态。") from exc
+
+    if not isinstance(response_data, dict):
+        raise gr.Error("百炼接口响应格式异常，无法确认 API Key 状态。")
+    if response_data.get("success") is False or response_data.get("code"):
+        detail = str(response_data.get("message") or response_data.get("code"))
+        detail = detail.replace(api_key, _mask_api_key(api_key))
+        raise gr.Error(f"百炼接口测试失败：{detail}")
+
+    output_data = response_data.get("output")
+    models = output_data.get("models", []) if isinstance(output_data, dict) else []
+    if not isinstance(models, list) or not any(
+        isinstance(item, dict) and str(item.get("model", "")) == model
+        for item in models
+    ):
+        raise gr.Error(
+            f"API Key 已通过认证，但模型目录中未找到 {model}。"
+            "请检查模型 ID、地域/业务空间和模型开通状态。"
+        )
+
+    fingerprint = _account_config_fingerprint(
+        model, api_key, synthesis_url, task_url_template
+    )
+    with _user_store_lock:
+        store = _read_user_store()
+        saved_user = store["users"].get(username)
+        if not saved_user:
+            raise gr.Error("当前账号已不存在，请重新登录。")
+        saved_user["api_config_tested_fingerprint"] = fingerprint
+        _save_user_store(store)
+
+    return (
+        f"测试通过：API Key 认证成功，模型 `{model}` 可在当前百炼接口中查询。"
+        "本次仅检查模型目录，没有提交视频生成任务；实际生成仍受模型权限、额度和服务状态影响。"
+    )
+
+
+def clear_api_test_status() -> str:
+    return ""
 
 
 def save_account_settings(
@@ -971,7 +1103,7 @@ with gr.Blocks(title="阿里云百炼批量分镜视频生成") as demo:
             )
         with gr.Column(scale=1, min_width=80):
             gr.Button("退出", link="/logout", variant="secondary")
-    with gr.Accordion("账号与百炼配置", open=True):
+    with gr.Accordion("账号与百炼配置", open=True) as account_config_accordion:
         account_status = gr.Markdown()
         with gr.Row():
             model_input = gr.Dropdown(
@@ -997,12 +1129,32 @@ with gr.Blocks(title="阿里云百炼批量分镜视频生成") as demo:
             value=TASK_URL_TEMPLATE,
             info="地址中必须包含 {task_id}，并与模型和 API Key 所属地域匹配。",
         )
-        save_account_button = gr.Button("保存百炼配置")
+        with gr.Row():
+            save_account_button = gr.Button("保存百炼配置", variant="primary")
+            test_account_button = gr.Button("测试百炼接口")
         config_save_status = gr.Markdown()
+        config_test_status = gr.Markdown()
+        for config_component in (
+            model_input,
+            api_key_input,
+            synthesis_url_input,
+            task_url_input,
+        ):
+            config_component.input(
+                fn=clear_api_test_status,
+                inputs=[],
+                outputs=config_test_status,
+                queue=False,
+            )
         save_account_button.click(
             fn=save_account_settings,
             inputs=[model_input, api_key_input, synthesis_url_input, task_url_input],
             outputs=config_save_status,
+        )
+        test_account_button.click(
+            fn=test_account_settings,
+            inputs=[model_input, api_key_input, synthesis_url_input, task_url_input],
+            outputs=config_test_status,
         )
 
         gr.Markdown("### 修改登录密码")
@@ -1187,6 +1339,7 @@ with gr.Blocks(title="阿里云百炼批量分镜视频生成") as demo:
             admin_user_table,
             operation_log_panel,
             operation_log_table,
+            account_config_accordion,
         ],
     )
 
