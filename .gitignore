@@ -1,6 +1,9 @@
 .env
 .env.*
 !.env.example
+user.json
+operation_log.csv
+operation_log_*.xlsx
 .venv/
 venv/
 __pycache__/
