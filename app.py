@@ -45,8 +45,10 @@ OPERATION_LOG_FILE = PROJECT_DIR / "operation_log.csv"
 SCENE_COUNT = 5
 MAX_CONCURRENT_BATCHES = 3
 MAX_OPERATION_LOG_ROWS = 500
+HISTORY_PAGE_SIZE = 30
 OPERATION_LOG_FIELDS = (
     "time",
+    "generated_at",
     "username",
     "model",
     "api_key_masked",
@@ -62,6 +64,7 @@ OPERATION_LOG_FIELDS = (
 )
 OPERATION_LOG_HEADERS = (
     "时间",
+    "生成完成时间",
     "账号",
     "模型",
     "API Key（脱敏）",
@@ -120,6 +123,38 @@ def _ensure_operation_log() -> None:
             with OPERATION_LOG_FILE.open("w", encoding="utf-8-sig", newline="") as log_file:
                 writer = csv.DictWriter(log_file, fieldnames=OPERATION_LOG_FIELDS)
                 writer.writeheader()
+        else:
+            with OPERATION_LOG_FILE.open(
+                "r", encoding="utf-8-sig", newline=""
+            ) as log_file:
+                reader = csv.DictReader(log_file)
+                existing_fields = reader.fieldnames or []
+                if "generated_at" not in existing_fields:
+                    existing_rows = list(reader)
+                    fd, migrated_path = tempfile.mkstemp(
+                        prefix="operation_log_migrate_",
+                        suffix=".csv",
+                        dir=str(OPERATION_LOG_FILE.parent),
+                    )
+                    try:
+                        with os.fdopen(
+                            fd, "w", encoding="utf-8-sig", newline=""
+                        ) as migrated_file:
+                            writer = csv.DictWriter(
+                                migrated_file, fieldnames=OPERATION_LOG_FIELDS
+                            )
+                            writer.writeheader()
+                            writer.writerows(
+                                {
+                                    field: row.get(field, "")
+                                    for field in OPERATION_LOG_FIELDS
+                                }
+                                for row in existing_rows
+                            )
+                        os.replace(migrated_path, OPERATION_LOG_FILE)
+                    except Exception:
+                        Path(migrated_path).unlink(missing_ok=True)
+                        raise
         os.chmod(OPERATION_LOG_FILE, 0o600)
 
 
@@ -152,6 +187,137 @@ def _operation_log_table_data() -> list[list[str]]:
         [row.get(field, "") for field in OPERATION_LOG_FIELDS]
         for row in reversed(rows)
     ]
+
+
+def _history_sort_timestamp(row: dict[str, str], video_path: Path) -> float:
+    generated_at = (row.get("generated_at") or "").strip()
+    if generated_at:
+        try:
+            parsed = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+            return parsed.timestamp()
+        except ValueError:
+            pass
+    return video_path.stat().st_mtime
+
+
+def _user_video_history(username: str) -> list[dict[str, object]]:
+    root = _user_output_dir(username).resolve()
+    history_by_path: dict[str, dict[str, object]] = {}
+    for row in _read_operation_log():
+        if row.get("username") != username or row.get("result") != "成功":
+            continue
+        raw_path = (row.get("video_path") or "").strip()
+        if not raw_path:
+            continue
+        try:
+            video_path = Path(raw_path).resolve(strict=True)
+            if not video_path.is_file() or not video_path.is_relative_to(root):
+                continue
+            sort_timestamp = _history_sort_timestamp(row, video_path)
+        except (OSError, RuntimeError, ValueError):
+            continue
+
+        history_by_path[str(video_path)] = {
+            "video_path": str(video_path),
+            "sort_timestamp": sort_timestamp,
+            "generated_at": datetime.fromtimestamp(sort_timestamp)
+            .astimezone()
+            .strftime("%Y-%m-%d %H:%M:%S"),
+            "scene_number": row.get("scene_number", ""),
+            "model": row.get("model", ""),
+            "duration_seconds": row.get("duration_seconds", ""),
+            "orientation": row.get("orientation", ""),
+            "audio": row.get("audio", ""),
+            "prompt": row.get("prompt", ""),
+            "filename": video_path.name,
+        }
+    return sorted(
+        history_by_path.values(),
+        key=lambda entry: (entry["sort_timestamp"], entry["video_path"]),
+        reverse=True,
+    )
+
+
+HISTORY_TABLE_HEADERS = (
+    "生成时间",
+    "分镜",
+    "模型",
+    "时长（秒）",
+    "画幅",
+    "音轨",
+    "视频提示词",
+    "文件名",
+)
+
+
+def _history_page_rows(
+    history: list[dict[str, object]], page: int
+) -> tuple[list[list[str]], int, str]:
+    total = len(history)
+    page_count = max(1, (total + HISTORY_PAGE_SIZE - 1) // HISTORY_PAGE_SIZE)
+    page = min(max(0, page), page_count - 1)
+    start = page * HISTORY_PAGE_SIZE
+    page_history = history[start : start + HISTORY_PAGE_SIZE]
+    table_rows = [
+        [
+            str(entry["generated_at"]),
+            str(entry["scene_number"]),
+            str(entry["model"]),
+            str(entry["duration_seconds"]),
+            str(entry["orientation"]),
+            str(entry["audio"]),
+            str(entry["prompt"]),
+            str(entry["filename"]),
+        ]
+        for entry in page_history
+    ]
+    status = f"共 {total} 条记录 · 第 {page + 1}/{page_count} 页，每页最多 {HISTORY_PAGE_SIZE} 条"
+    return table_rows, page, status
+
+
+def _load_user_video_history(request: gr.Request):
+    username = _request_username(request)
+    history = _user_video_history(username)
+    table_rows, page, status = _history_page_rows(history, 0)
+    return table_rows, history, page, status, None, None
+
+
+def _change_history_page(
+    history: list[dict[str, object]], page: int, delta: int
+):
+    table_rows, page, status = _history_page_rows(history, page + delta)
+    return table_rows, page, status, None, None
+
+
+def _previous_history_page(history: list[dict[str, object]], page: int):
+    return _change_history_page(history, page, -1)
+
+
+def _next_history_page(history: list[dict[str, object]], page: int):
+    return _change_history_page(history, page, 1)
+
+
+def _select_history_video(
+    request: gr.Request,
+    history: list[dict[str, object]],
+    page: int,
+    event: gr.SelectData,
+):
+    username = _request_username(request)
+    row_index = event.index
+    while isinstance(row_index, (list, tuple)):
+        if not row_index:
+            raise gr.Error("无法识别所选视频，请重新选择一条记录。")
+        row_index = row_index[0]
+    try:
+        selected = history[int(page) * HISTORY_PAGE_SIZE + int(row_index)]
+        root = _user_output_dir(username).resolve()
+        video_path = Path(str(selected["video_path"])).resolve(strict=True)
+    except (IndexError, OSError, RuntimeError, ValueError, KeyError) as exc:
+        raise gr.Error("所选视频已不存在，请刷新历史记录后重试。") from exc
+    if not video_path.is_file() or not video_path.is_relative_to(root):
+        raise gr.Error("所选视频不属于当前账号或已不存在，请刷新历史记录。")
+    return str(video_path), str(video_path)
 
 
 def _admin_operation_log_table(request: gr.Request) -> list[list[str]]:
@@ -193,7 +359,7 @@ def export_operation_log_excel(request: gr.Request) -> str:
 
     worksheet.freeze_panes = "A2"
     worksheet.auto_filter.ref = worksheet.dimensions
-    widths = (22, 18, 24, 28, 30, 64, 54, 16, 12, 16, 12, 12, 64)
+    widths = (22, 22, 18, 24, 28, 30, 64, 54, 16, 12, 16, 12, 12, 64)
     for index, width in enumerate(widths, start=1):
         worksheet.column_dimensions[worksheet.cell(1, index).column_letter].width = width
 
@@ -577,6 +743,7 @@ def generate_batch(request: gr.Request, *values):
             image_path, prompt, dialogue, audio, orientation, duration = scene
             operation_record: dict[str, object] = {
                 "time": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "generated_at": "",
                 "username": username,
                 "model": model,
                 "api_key_masked": _mask_api_key(api_key),
@@ -608,6 +775,9 @@ def generate_batch(request: gr.Request, *values):
                     operation_record,
                 ):
                     if video_path:
+                        operation_record["generated_at"] = (
+                            datetime.now().astimezone().isoformat(timespec="seconds")
+                        )
                         _set_user_scene_file(
                             username, scene_number, Path(video_path)
                         )
@@ -1223,61 +1393,84 @@ with gr.Blocks(title="阿里云百炼批量分镜视频生成") as demo:
                 outputs=[delete_user_status, admin_user_table],
             )
 
-    scene_inputs = []
-    scene_videos = []
-    scene_statuses = []
-    for scene_number in range(1, SCENE_COUNT + 1):
-        with gr.Accordion(f"分镜 {scene_number}", open=scene_number == 1):
-            with gr.Row():
-                with gr.Column():
-                    image = gr.Image(
-                        label="首帧图片",
-                        type="filepath",
-                        sources=["upload"],
-                        image_mode="RGB",
+    with gr.Tabs():
+        with gr.Tab("生成视频"):
+            scene_inputs = []
+            scene_videos = []
+            scene_statuses = []
+            for scene_number in range(1, SCENE_COUNT + 1):
+                with gr.Accordion(f"分镜 {scene_number}", open=scene_number == 1):
+                    with gr.Row():
+                        with gr.Column():
+                            image = gr.Image(
+                                label="首帧图片",
+                                type="filepath",
+                                sources=["upload"],
+                                image_mode="RGB",
+                            )
+                            prompt = gr.Textbox(
+                                label="视频提示词",
+                                placeholder="描述画面中的人物动作、场景变化和镜头运动",
+                                lines=4,
+                            )
+                            dialogue = gr.Textbox(
+                                label="对白 / 旁白（可选）",
+                                placeholder="输入本分镜需要生成的对白或旁白",
+                                lines=3,
+                            )
+                            generate_audio = gr.Checkbox(
+                                label="生成视频音轨",
+                                value=True,
+                                info="语音内容及口型同步可能存在误差。",
+                            )
+                            orientation = gr.Radio(
+                                choices=["横屏 16:9", "竖屏 9:16"],
+                                value="竖屏 9:16",
+                                label="画面方向",
+                            )
+                            duration = gr.Slider(
+                                minimum=2,
+                                maximum=30,
+                                step=1,
+                                value=5,
+                                label="视频时长（秒）",
+                            )
+                        with gr.Column():
+                            scene_videos.append(gr.Video(label="生成结果"))
+                            scene_statuses.append(
+                                gr.Textbox(label="任务状态", interactive=False)
+                            )
+                    scene_inputs.extend(
+                        [image, prompt, dialogue, generate_audio, orientation, duration]
                     )
-                    prompt = gr.Textbox(
-                        label="视频提示词",
-                        placeholder="描述画面中的人物动作、场景变化和镜头运动",
-                        lines=4,
-                    )
-                    dialogue = gr.Textbox(
-                        label="对白 / 旁白（可选）",
-                        placeholder="输入本分镜需要生成的对白或旁白",
-                        lines=3,
-                    )
-                    generate_audio = gr.Checkbox(
-                        label="生成视频音轨",
-                        value=True,
-                        info="语音内容及口型同步可能存在误差。",
-                    )
-                    orientation = gr.Radio(
-                        choices=["横屏 16:9", "竖屏 9:16"],
-                        value="竖屏 9:16",
-                        label="画面方向",
-                    )
-                    duration = gr.Slider(
-                        minimum=2,
-                        maximum=30,
-                        step=1,
-                        value=5,
-                        label="视频时长（秒）",
-                    )
-                with gr.Column():
-                    scene_videos.append(gr.Video(label="生成结果"))
-                    scene_statuses.append(
-                        gr.Textbox(label="任务状态", interactive=False)
-                    )
-            scene_inputs.extend(
-                [image, prompt, dialogue, generate_audio, orientation, duration]
-            )
 
-    generate_all = gr.Button("批量生成分镜视频", variant="primary")
-    with gr.Row():
-        download_zip_button = gr.Button("批量下载分镜视频（ZIP）")
-        merge_button = gr.Button("一键下载合并视频")
-    zip_file = gr.File(label="分镜视频压缩包")
-    merged_file = gr.File(label="合并后完整视频")
+            generate_all = gr.Button("批量生成分镜视频", variant="primary")
+            with gr.Row():
+                download_zip_button = gr.Button("批量下载分镜视频（ZIP）")
+                merge_button = gr.Button("一键下载合并视频")
+            zip_file = gr.File(label="分镜视频压缩包")
+            merged_file = gr.File(label="合并后完整视频")
+
+        with gr.Tab("历史记录") as history_tab:
+            gr.Markdown("生成成功的视频按完成时间倒序排列；选择一条记录可在线播放并下载。")
+            history_refresh_button = gr.Button("刷新历史记录")
+            history_table = gr.Dataframe(
+                value=[],
+                headers=list(HISTORY_TABLE_HEADERS),
+                datatype=["str"] * len(HISTORY_TABLE_HEADERS),
+                interactive=False,
+                wrap=True,
+                max_height=480,
+            )
+            history_page_status = gr.Markdown()
+            with gr.Row():
+                history_previous_button = gr.Button("上一页")
+                history_next_button = gr.Button("下一页")
+            with gr.Row():
+                history_video = gr.Video(label="在线播放")
+                history_download = gr.DownloadButton(label="下载到本地")
+            history_state = gr.State([])
+            history_page = gr.State(0)
 
     with gr.Group(visible=False) as operation_log_panel:
         gr.Markdown(
@@ -1327,6 +1520,51 @@ with gr.Blocks(title="阿里云百炼批量分镜视频生成") as demo:
         inputs=scene_videos,
         outputs=merged_file,
     )
+    history_outputs = [
+        history_table,
+        history_state,
+        history_page,
+        history_page_status,
+        history_video,
+        history_download,
+    ]
+    history_refresh_button.click(
+        fn=_load_user_video_history,
+        inputs=[],
+        outputs=history_outputs,
+    )
+    history_tab.select(
+        fn=_load_user_video_history,
+        inputs=[],
+        outputs=history_outputs,
+    )
+    history_previous_button.click(
+        fn=_previous_history_page,
+        inputs=[history_state, history_page],
+        outputs=[
+            history_table,
+            history_page,
+            history_page_status,
+            history_video,
+            history_download,
+        ],
+    )
+    history_next_button.click(
+        fn=_next_history_page,
+        inputs=[history_state, history_page],
+        outputs=[
+            history_table,
+            history_page,
+            history_page_status,
+            history_video,
+            history_download,
+        ],
+    )
+    history_table.select(
+        fn=_select_history_video,
+        inputs=[history_state, history_page],
+        outputs=[history_video, history_download],
+    )
     demo.load(
         fn=load_account_settings,
         inputs=[],
@@ -1341,6 +1579,11 @@ with gr.Blocks(title="阿里云百炼批量分镜视频生成") as demo:
             operation_log_table,
             account_config_accordion,
         ],
+    )
+    demo.load(
+        fn=_load_user_video_history,
+        inputs=[],
+        outputs=history_outputs,
     )
 
 
